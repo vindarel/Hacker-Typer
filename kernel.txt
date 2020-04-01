@@ -1,531 +1,243 @@
-struct group_info init_groups = { .usage = ATOMIC_INIT(2) };
-
-struct group_info *groups_alloc(int gidsetsize){
-
-	struct group_info *group_info;
-
-	int nblocks;
-
-	int i;
-
-
-
-	nblocks = (gidsetsize + NGROUPS_PER_BLOCK - 1) / NGROUPS_PER_BLOCK;
-
-	/* Make sure we always allocate at least one indirect block pointer */
-
-	nblocks = nblocks ? : 1;
-
-	group_info = kmalloc(sizeof(*group_info) + nblocks*sizeof(gid_t *), GFP_USER);
-
-	if (!group_info)
-
-		return NULL;
-
-	group_info->ngroups = gidsetsize;
-
-	group_info->nblocks = nblocks;
-
-	atomic_set(&group_info->usage, 1);
-
-
-
-	if (gidsetsize <= NGROUPS_SMALL)
-
-		group_info->blocks[0] = group_info->small_block;
-
-	else {
-
-		for (i = 0; i < nblocks; i++) {
-
-			gid_t *b;
-
-			b = (void *)__get_free_page(GFP_USER);
-
-			if (!b)
-
-				goto out_undo_partial_alloc;
-
-			group_info->blocks[i] = b;
-
-		}
-
-	}
-
-	return group_info;
-
-
-
-out_undo_partial_alloc:
-
-	while (--i >= 0) {
-
-		free_page((unsigned long)group_info->blocks[i]);
-
-	}
-
-	kfree(group_info);
-
-	return NULL;
-
-}
-
-
-
-EXPORT_SYMBOL(groups_alloc);
-
-
-
-void groups_free(struct group_info *group_info)
-
-{
-
-	if (group_info->blocks[0] != group_info->small_block) {
-
-		int i;
-
-		for (i = 0; i < group_info->nblocks; i++)
-
-			free_page((unsigned long)group_info->blocks[i]);
-
-	}
-
-	kfree(group_info);
-
-}
-
-
-
-EXPORT_SYMBOL(groups_free);
-
-
-
-/* export the group_info to a user-space array */
-
-static int groups_to_user(gid_t __user *grouplist,
-
-			  const struct group_info *group_info)
-
-{
-
-	int i;
-
-	unsigned int count = group_info->ngroups;
-
-
-
-	for (i = 0; i < group_info->nblocks; i++) {
-
-		unsigned int cp_count = min(NGROUPS_PER_BLOCK, count);
-
-		unsigned int len = cp_count * sizeof(*grouplist);
-
-
-
-		if (copy_to_user(grouplist, group_info->blocks[i], len))
-
-			return -EFAULT;
-
-
-
-		grouplist += NGROUPS_PER_BLOCK;
-
-		count -= cp_count;
-
-	}
-
-	return 0;
-
-}
-
-
-
-/* fill a group_info from a user-space array - it must be allocated already */
-
-static int groups_from_user(struct group_info *group_info,
-
-    gid_t __user *grouplist)
-
-{
-
-	int i;
-
-	unsigned int count = group_info->ngroups;
-
-
-
-	for (i = 0; i < group_info->nblocks; i++) {
-
-		unsigned int cp_count = min(NGROUPS_PER_BLOCK, count);
-
-		unsigned int len = cp_count * sizeof(*grouplist);
-
-
-
-		if (copy_from_user(group_info->blocks[i], grouplist, len))
-
-			return -EFAULT;
-
-
-
-		grouplist += NGROUPS_PER_BLOCK;
-
-		count -= cp_count;
-
-	}
-
-	return 0;
-
-}
-
-
-
-/* a simple Shell sort */
-
-static void groups_sort(struct group_info *group_info)
-
-{
-
-	int base, max, stride;
-
-	int gidsetsize = group_info->ngroups;
-
-
-
-	for (stride = 1; stride < gidsetsize; stride = 3 * stride + 1)
-
-		; /* nothing */
-
-	stride /= 3;
-
-
-
-	while (stride) {
-
-		max = gidsetsize - stride;
-
-		for (base = 0; base < max; base++) {
-
-			int left = base;
-
-			int right = left + stride;
-
-			gid_t tmp = GROUP_AT(group_info, right);
-
-
-
-			while (left >= 0 && GROUP_AT(group_info, left) > tmp) {
-
-				GROUP_AT(group_info, right) =
-
-				    GROUP_AT(group_info, left);
-
-				right = left;
-
-				left -= stride;
-
-			}
-
-			GROUP_AT(group_info, right) = tmp;
-
-		}
-
-		stride /= 3;
-
-	}
-
-}
-
-
-
-/* a simple bsearch */
-
-int groups_search(const struct group_info *group_info, gid_t grp)
-
-{
-
-	unsigned int left, right;
-
-
-
-	if (!group_info)
-
-		return 0;
-
-
-
-	left = 0;
-
-	right = group_info->ngroups;
-
-	while (left < right) {
-
-		unsigned int mid = left + (right - left)/2;
-
-		if (grp > GROUP_AT(group_info, mid))
-
-			left = mid + 1;
-
-		else if (grp < GROUP_AT(group_info, mid))
-
-			right = mid;
-
-		else
-
-			return 1;
-
-	}
-
-	return 0;
-
-}
-
-
-
-/**
-
- * set_groups - Change a group subscription in a set of credentials
-
- * @new: The newly prepared set of credentials to alter
-
- * @group_info: The group list to install
-
- *
-
- * Validate a group subscription and, if valid, insert it into a set
-
- * of credentials.
-
- */
-
-int set_groups(struct cred *new, struct group_info *group_info)
-
-{
-
-	put_group_info(new->group_info);
-
-	groups_sort(group_info);
-
-	get_group_info(group_info);
-
-	new->group_info = group_info;
-
-	return 0;
-
-}
-
-
-
-EXPORT_SYMBOL(set_groups);
-
-
-
-/**
-
- * set_current_groups - Change current's group subscription
-
- * @group_info: The group list to impose
-
- *
-
- * Validate a group subscription and, if valid, impose it upon current's task
-
- * security record.
-
- */
-
-int set_current_groups(struct group_info *group_info)
-
-{
-
-	struct cred *new;
-
-	int ret;
-
-
-
-	new = prepare_creds();
-
-	if (!new)
-
-		return -ENOMEM;
-
-
-
-	ret = set_groups(new, group_info);
-
-	if (ret < 0) {
-
-		abort_creds(new);
-
-		return ret;
-
-	}
-
-
-
-	return commit_creds(new);
-
-}
-
-
-
-EXPORT_SYMBOL(set_current_groups);
-
-
-
-SYSCALL_DEFINE2(getgroups, int, gidsetsize, gid_t __user *, grouplist)
-
-{
-
-	const struct cred *cred = current_cred();
-
-	int i;
-
-
-
-	if (gidsetsize < 0)
-
-		return -EINVAL;
-
-
-
-	/* no need to grab task_lock here; it cannot change */
-
-	i = cred->group_info->ngroups;
-
-	if (gidsetsize) {
-
-		if (i > gidsetsize) {
-
-			i = -EINVAL;
-
-			goto out;
-
-		}
-
-		if (groups_to_user(grouplist, cred->group_info)) {
-
-			i = -EFAULT;
-
-			goto out;
-
-		}
-
-	}
-
-out:
-
-	return i;
-
-}
-
-
-
-/*
-
- *	SMP: Our groups are copy-on-write. We can set them safely
-
- *	without another task interfering.
-
- */
-
-
-
-SYSCALL_DEFINE2(setgroups, int, gidsetsize, gid_t __user *, grouplist)
-
-{
-
-	struct group_info *group_info;
-
-	int retval;
-
-
-
-	if (!nsown_capable(CAP_SETGID))
-
-		return -EPERM;
-
-	if ((unsigned)gidsetsize > NGROUPS_MAX)
-
-		return -EINVAL;
-
-
-
-	group_info = groups_alloc(gidsetsize);
-
-	if (!group_info)
-
-		return -ENOMEM;
-
-	retval = groups_from_user(group_info, grouplist);
-
-	if (retval) {
-
-		put_group_info(group_info);
-
-		return retval;
-
-	}
-
-
-
-	retval = set_current_groups(group_info);
-
-	put_group_info(group_info);
-
-
-
-	return retval;
-
-}
-
-
-
-/*
-
- * Check whether we're fsgid/egid or in the supplemental group..
-
- */
-
-int in_group_p(gid_t grp)
-
-{
-
-	const struct cred *cred = current_cred();
-
-	int retval = 1;
-
-
-
-	if (grp != cred->fsgid)
-
-		retval = groups_search(cred->group_info, grp);
-
-	return retval;
-
-}
-
-
-
-EXPORT_SYMBOL(in_group_p);
-
-
-
-int in_egroup_p(gid_t grp)
-
-{
-
-	const struct cred *cred = current_cred();
-
-	int retval = 1;
-
-
-
-	if (grp != cred->egid)
-
-		retval = groups_search(cred->group_info, grp);
-
-	return retval;
-
-}
+(defun convert-ast-form (form inherit new-variables)
+  (when (symbolp form)
+    (let ((var (assoc form new-variables)))
+      (assert var () "Missing substitution variable ~S" form)
+      (return-from convert-ast-form (cdr var))))
+  (when (not (consp form))
+    (return-from convert-ast-form form))
+  (apply (ecase (first form)
+           ((block) #'convert-ast-block)
+           ((function) #'convert-ast-function)
+           ((go) #'convert-ast-go)
+           ((if) #'convert-ast-if)
+           ((let) #'convert-ast-let)
+           ((multiple-value-bind) #'convert-ast-multiple-value-bind)
+           ((multiple-value-call) #'convert-ast-multiple-value-call)
+           ((multiple-value-prog1) #'convert-ast-multiple-value-prog1)
+           ((progn) #'convert-ast-progn)
+           ((quote) #'convert-ast-quote)
+           ((return-from) #'convert-ast-return-from)
+           ((setq) #'convert-ast-setq)
+           ((tagbody) #'convert-ast-tagbody)
+           ((the) #'convert-ast-the)
+           ((unwind-protect) #'convert-ast-unwind-protect)
+           ((call) #'convert-ast-call)
+           ((call-optimize) #'convert-ast-call-optimize)
+           ((source-fragment) #'convert-ast-source-fragment)
+           ((notinline-call) #'convert-ast-notinline-call)
+           ((jump-table) #'convert-ast-jump-table))
+         inherit
+         new-variables
+         (rest form)))
+
+(defun ast (form &optional (inherit *current-lambda*))
+  (convert-ast-form form inherit '()))
+
+(defun convert-ast-block (inherit new-variables name body)
+  (check-type name (or block-information symbol))
+  (let ((new-block (if (symbolp name)
+                       (make-instance 'block-information
+                                      :inherit inherit
+                                      :name name
+                                      :definition-point *current-lambda*
+                                      :use-count 1)
+                       name)))
+    (when (symbolp name)
+      (push (cons name new-block) new-variables))
+    (make-instance 'ast-block
+                   :inherit inherit
+                   :info new-block
+                   :body (convert-ast-form body inherit new-variables))))
+
+(defun convert-ast-function (inherit new-variables name)
+  (declare (ignore new-variables))
+  (make-instance 'ast-function
+                 :inherit inherit
+                 :name name))
+
+(defun convert-ast-go (inherit new-variables target info)
+  (make-instance 'ast-go
+                 :inherit inherit
+                 :target (convert-ast-form target inherit new-variables)
+                 :info (convert-ast-form info inherit new-variables)))
+
+(defun convert-ast-if (inherit new-variables test then else)
+  (make-instance 'ast-if
+                 :inherit inherit
+                 :test (convert-ast-form test inherit new-variables)
+                 :then (convert-ast-form then inherit new-variables)
+                 :else (convert-ast-form else inherit new-variables)))
+
+(defun convert-ast-let (inherit new-variables bindings body)
+  (let ((real-bindings (loop
+                          for (variable init-form) in bindings
+                          collect (list (etypecase variable
+                                          (symbol
+                                           (let ((new (make-instance 'lexical-variable
+                                                                     :inherit inherit
+                                                                     :name variable
+                                                                     :definition-point *current-lambda*
+                                                                     :use-count 1)))
+                                             (push (cons variable new) new-variables)
+                                             new))
+                                          ((or lexical-variable special-variable)
+                                           variable))
+                                        init-form))))
+    (make-instance 'ast-let
+                   :inherit inherit
+                   :bindings (loop
+                                for (variable init-form) in real-bindings
+                                collect (list variable (convert-ast-form init-form inherit new-variables)))
+                   :body (convert-ast-form body inherit new-variables))))
+
+(defun convert-ast-multiple-value-bind (inherit new-variables bindings value-form body)
+  (let ((value (convert-ast-form value-form inherit new-variables))
+        (real-bindings '()))
+    (dolist (binding bindings)
+      (cond ((symbolp binding)
+             (let ((new (make-instance 'lexical-variable
+                                       :inherit inherit
+                                       :name binding
+                                       :definition-point *current-lambda*
+                                       :use-count 1)))
+               (push (cons binding new) new-variables)
+               (push new real-bindings)))
+            (t (push binding real-bindings))))
+    (make-instance 'ast-multiple-value-bind
+                   :inherit inherit
+                   :bindings (reverse real-bindings)
+                   :value-form value
+                   :body (convert-ast-form body inherit new-variables))))
+
+(defun convert-ast-multiple-value-call (inherit new-variables function value-form)
+  (make-instance 'ast-multiple-value-call
+                 :inherit inherit
+                 :function-form (convert-ast-form function inherit new-variables)
+                 :value-form (convert-ast-form value-form inherit new-variables)))
+
+(defun convert-ast-multiple-value-prog1 (inherit new-variables value-form body)
+  (make-instance 'ast-multiple-value-prog1
+                 :inherit inherit
+                 :value-form (convert-ast-form value-form inherit new-variables)
+                 :body (convert-ast-form body inherit new-variables)))
+
+(defun convert-ast-progn (inherit new-variables &rest body)
+  (make-instance 'ast-progn
+                 :inherit inherit
+                 :forms (loop
+                           for form in body
+                           collect (convert-ast-form form inherit new-variables))))
+
+(defun convert-ast-quote (inherit new-variables value)
+  (declare (ignore new-variables))
+  (make-instance 'ast-quote
+                 :inherit inherit
+                 :value value))
+
+(defun convert-ast-return-from (inherit new-variables target value-form info)
+  (make-instance 'ast-return-from
+                 :inherit inherit
+                 :target (convert-ast-form target inherit new-variables)
+                 :value (convert-ast-form value-form inherit new-variables)
+                 :info (convert-ast-form info inherit new-variables)))
+
+(defun convert-ast-setq (inherit new-variables variable value)
+  (check-type variable (or symbol lexical-variable))
+  (make-instance 'ast-setq
+                 :inherit inherit
+                 :variable (convert-ast-form variable inherit new-variables)
+                 :value (convert-ast-form value inherit new-variables)))
+
+(defun convert-ast-tagbody (inherit new-variables info &rest statements)
+  (check-type info (or symbol tagbody-information))
+  (let ((tagbody-info (cond ((symbolp info)
+                             (make-instance 'tagbody-information
+                                            :inherit inherit
+                                            :name info
+                                            :definition-point *current-lambda*
+                                            :use-count 1))
+                            (t info)))
+        (new-go-tags '()))
+    (when (symbolp info)
+      (push (cons info tagbody-info) new-variables))
+    (loop
+       for (go-tag statement) in statements
+       do (etypecase go-tag
+            (go-tag
+             (assert (eql (go-tag-tagbody go-tag) tagbody-info)))
+            (symbol
+             (let ((tag (make-instance 'go-tag
+                                       :inherit inherit
+                                       :name go-tag
+                                       :tagbody tagbody-info
+                                       :use-count 1)))
+               (push (cons go-tag tag) new-variables)
+               (push tag new-go-tags)))))
+    (setf (tagbody-information-go-tags tagbody-info) (append (reverse new-go-tags)
+                                                             (tagbody-information-go-tags tagbody-info)))
+    (make-instance 'ast-tagbody
+                   :inherit inherit
+                   :info tagbody-info
+                   :statements (loop
+                                  for (go-tag statement) in statements
+                                  collect (list (convert-ast-form go-tag inherit new-variables)
+                                                (convert-ast-form statement inherit new-variables))))))
+
+(defun convert-ast-the (inherit new-variables type value)
+  (cond ((eql type 't)
+         (convert-ast-form value inherit new-variables))
+        (t
+         (make-instance 'ast-the
+                        :inherit inherit
+                        :type (sys.int::typeexpand type)
+                        :value (convert-ast-form value inherit new-variables)))))
+
+(defun convert-ast-unwind-protect (inherit new-variables protected-form cleanup-function)
+  (make-instance 'ast-unwind-protect
+                 :inherit inherit
+                 :protected-form (convert-ast-form protected-form inherit new-variables)
+                 :cleanup-function (convert-ast-form cleanup-function inherit new-variables)))
+
+(defun convert-ast-call (inherit new-variables name &rest arguments)
+  (make-instance 'ast-call
+                 :inherit inherit
+                 :name name
+                 :arguments (loop
+                               for form in arguments
+                               collect (convert-ast-form form inherit new-variables))))
+
+(defun convert-ast-call-optimize (inherit new-variables name optimize-settings &rest arguments)
+  (make-instance 'ast-call
+                 :inherit inherit
+                 :name name
+                 :optimize optimize-settings
+                 :arguments (loop
+                               for form in arguments
+                               collect (convert-ast-form form inherit new-variables))))
+
+(defun convert-ast-source-fragment (inherit new-variables form)
+  (declare (ignore inherit))
+  (pass1-form form
+              (extend-environment nil
+                                  :variables (mapcar (lambda (x)
+                                                       (list (car x) (cdr x)))
+                                                     new-variables))))
+
+(defun convert-ast-notinline-call (inherit new-variables name &rest arguments)
+  (let ((ast (make-instance 'ast-call
+                             :inherit inherit
+                             :name name)))
+    (push (list name 'notinline) (ast-inline-declarations ast))
+    (setf (ast-arguments ast)
+          (loop
+             for form in arguments
+             collect (convert-ast-form form ast new-variables)))
+    ast))
+
+(defun convert-ast-jump-table (inherit new-variables value &rest targets)
+  (make-instance 'ast-jump-table
+                 :inherit inherit
+                 :value (convert-ast-form value inherit new-variables)
+                 :targets (loop
+                             for form in targets
+                             collect (convert-ast-form form inherit new-variables))))
